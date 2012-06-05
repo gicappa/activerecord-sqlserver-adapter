@@ -14,9 +14,12 @@ require 'bundler'
 Bundler.setup
 require 'shoulda'
 require 'mocha'
+require 'active_support/dependencies'
+require 'active_record'
+require 'active_record/version'
+require 'active_record/connection_adapters/abstract_adapter'
 require 'cases/helper'
 require 'models/topic'
-require 'active_record/version'
 
 GC.copy_on_write_friendly = true if GC.respond_to?(:copy_on_write_friendly?)
 
@@ -36,7 +39,10 @@ class FloatData < ActiveRecord::Base ; self.table_name = 'float_data' ; end
 class CustomersView < ActiveRecord::Base ; self.table_name = 'customers_view' ; end
 class StringDefaultsView < ActiveRecord::Base ; self.table_name = 'string_defaults_view' ; end
 class StringDefaultsBigView < ActiveRecord::Base ; self.table_name = 'string_defaults_big_view' ; end
-class SqlServerNaturalPkData < ActiveRecord::Base ; self.table_name = 'natural_pk_data' ; end
+class SqlServerNaturalPkData < ActiveRecord::Base ; self.table_name = 'natural_pk_data' ; self.primary_key = 'legacy_id' ; end
+class SqlServerTinyintPk < ActiveRecord::Base ; self.table_name = 'tinyint_pk_table' ; end
+class SqlServerNaturalPkIntData < ActiveRecord::Base ; self.table_name = 'natural_pk_int_data' ; end
+class SqlServerOrderRowNumber < ActiveRecord::Base ; self.table_name = 'order_row_number' ; end
 class SqlServerNaturalPkDataSchema < ActiveRecord::Base ; self.table_name = 'test.sql_server_schema_natural_id' ; end
 class SqlServerQuotedTable < ActiveRecord::Base ; self.table_name = 'quoted-table' ; end
 class SqlServerQuotedView1 < ActiveRecord::Base ; self.table_name = 'quoted-view1' ; end
@@ -52,6 +58,9 @@ class SqlServerEdgeSchema < ActiveRecord::Base
   def set_new_id
     self[:guid_newid] ||= connection.newid_function if new_id_setting
   end
+end
+class SqlServerDollarTableName < ActiveRecord::Base
+  self.table_name = 'my$strange_table'
 end
 class SqlServerChronic < ActiveRecord::Base
   coerce_sqlserver_date :date
@@ -90,10 +99,10 @@ end
 
 module ActiveRecord
   class SQLCounter
-    self.ignored_sql =  [ 
+    self.ignored_sql.concat([ 
       %r|SELECT SCOPE_IDENTITY|, %r{INFORMATION_SCHEMA\.(TABLES|VIEWS|COLUMNS)},
       %r|SELECT @@version|, %r|SELECT @@TRANCOUNT|, %r{(BEGIN|COMMIT|ROLLBACK|SAVE) TRANSACTION}
-    ]
+    ])
   end
 end
 

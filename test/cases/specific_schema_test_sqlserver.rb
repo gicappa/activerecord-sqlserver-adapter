@@ -47,7 +47,41 @@ class SpecificSchemaTestSqlserver < ActiveRecord::TestCase
       @edge_class = SqlServerEdgeSchema
     end
     
-    context 'With special quoted column' do
+    context 'with tinyint primary key' do
+      
+      should 'work with identity inserts and finders' do
+        record = SqlServerTinyintPk.new :name => '1'
+        record.id = 1
+        record.save!
+        assert_equal record, SqlServerTinyintPk.find(1)
+      end
+      
+    end
+    
+    context 'with natural primary keys' do
+
+      should 'work with identity inserts' do
+        record = SqlServerNaturalPkData.new :name => 'Test', :description => 'Natural identity inserts.'
+        record.id = '12345ABCDE'
+        assert record.save
+        assert_equal '12345ABCDE', record.reload.id
+      end
+      
+      should 'work with identity inserts when the key is an int' do
+        record = SqlServerNaturalPkIntData.new :name => 'Test', :description => 'Natural identity inserts.'
+        record.id = 12
+        assert record.save
+        assert_equal 12, record.reload.id
+      end
+      
+      should 'use primary key for row table order in pagination sql' do
+        sql = /OVER \(ORDER BY \[natural_pk_data\]\.\[legacy_id\] ASC\)/
+        assert_sql(sql) { SqlServerNaturalPkData.limit(5).offset(5).all }
+      end
+
+    end
+    
+    context 'with special quoted column' do
 
       should 'work as normal' do
         @edge_class.delete_all
@@ -144,6 +178,15 @@ class SpecificSchemaTestSqlserver < ActiveRecord::TestCase
         assert_guid obj.guid_newid
       end
 
+    end
+    
+    context 'with strange table names' do
+      
+      should 'handle dollar symbols' do
+        SqlServerDollarTableName.new.save
+        SqlServerDollarTableName.limit(20).offset(1).all
+      end
+      
     end
     
   end

@@ -6,8 +6,8 @@ if ENV['RAILS_SOURCE']
 else
   spec = eval(File.read('activerecord-sqlserver-adapter.gemspec'))
   ar_version = spec.dependencies.detect{ |d|d.name == 'activerecord' }.requirement.requirements.first.last.version
-  gem 'rails', :git => "git://github.com/rails/rails.git", :tag => "v#{ar_version}"
-  gem 'bcrypt-ruby', '~> 3.0.0'
+  version = ENV['RAILS_VERSION'] || ar_version
+  gem 'rails', :git => "git://github.com/rails/rails.git", :tag => "v#{version}"
 end
 
 if ENV['AREL']
@@ -18,7 +18,7 @@ group :tinytds do
   if ENV['TINYTDS_SOURCE']
     gem 'tiny_tds', :path => ENV['TINYTDS_SOURCE']
   else
-    gem 'tiny_tds', '>= 0.4.5'
+    gem 'tiny_tds', '0.5.1'
   end
 end
 
@@ -27,9 +27,11 @@ group :odbc do
 end
 
 group :development do
+  gem 'bcrypt-ruby', '~> 3.0.0'
   gem 'rake', '0.9.2'
   gem 'mocha', '0.9.8'
   gem 'shoulda', '2.10.3'
   gem 'bench_press'
+  gem 'nokogiri'
 end
 

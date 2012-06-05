@@ -19,12 +19,6 @@ class AdapterTestSqlserver < ActiveRecord::TestCase
   
   context 'For abstract behavior' do
     
-    should 'not mangel complex order clauses' do
-      xyz_order = "CASE WHEN [title] LIKE N'XYZ%' THEN 0 ELSE 1 END"
-      xyz_post = Post.create :title => 'XYZ Post', :body => 'Test cased orders.'
-      assert_equal xyz_post, Post.order(Arel::Nodes::Ordering.new(Arel.sql(xyz_order))).first
-    end
-    
     should 'have a 128 max #table_alias_length' do
       assert @connection.table_alias_length <= 128
     end
@@ -39,6 +33,30 @@ class AdapterTestSqlserver < ActiveRecord::TestCase
     
     should 'include version in inspect' do
       assert_match(/version\: \d.\d/,@connection.inspect)
+    end
+    
+    should 'include database product level in inspect' do
+      assert_match(/product_level\: "\w+/, @connection.inspect)
+    end
+    
+    should 'include database product version in inspect' do
+      assert_match(/product_version\: "\d+/, @connection.inspect)
+    end
+    
+    should 'include database edition in inspect' do
+      assert_match(/edition\: "\w+/, @connection.inspect)
+    end
+    
+    should 'set database product level' do
+      assert_match(/\w+/, @connection.product_level)
+    end
+    
+    should 'set database product version' do
+      assert_match(/\d+/, @connection.product_version)
+    end
+    
+    should 'set database edition' do
+      assert_match(/\w+/, @connection.edition)
     end
     
     should 'support migrations' do
@@ -85,7 +103,7 @@ class AdapterTestSqlserver < ActiveRecord::TestCase
       
     end
     
-    context 'for #unqualify_table_name and #unqualify_db_name' do
+    context 'for Utils.unqualify_table_name and Utils.unqualify_db_name' do
     
       setup do
         @expected_table_name = 'baz'
@@ -95,25 +113,25 @@ class AdapterTestSqlserver < ActiveRecord::TestCase
         @qualifed_table_names = @first_second_table_names + @third_table_names
       end
       
-      should 'return clean table_name from #unqualify_table_name' do
+      should 'return clean table_name from Utils.unqualify_table_name' do
         @qualifed_table_names.each do |qtn|
           assert_equal @expected_table_name, 
-            @connection.send(:unqualify_table_name,qtn),
+            ActiveRecord::ConnectionAdapters::Sqlserver::Utils.unqualify_table_name(qtn),
             "This qualifed_table_name #{qtn} did not unqualify correctly."
         end
       end
       
-      should 'return nil from #unqualify_db_name when table_name is less than 2 qualified' do
+      should 'return nil from Utils.unqualify_db_name when table_name is less than 2 qualified' do
         @first_second_table_names.each do |qtn|
-          assert_equal nil, @connection.send(:unqualify_db_name,qtn),
+          assert_equal nil, ActiveRecord::ConnectionAdapters::Sqlserver::Utils.unqualify_db_name(qtn),
             "This qualifed_table_name #{qtn} did not return nil."
         end
       end
       
-      should 'return clean db_name from #unqualify_db_name when table is thrid level qualified' do
+      should 'return clean db_name from Utils.unqualify_db_name when table is thrid level qualified' do
         @third_table_names.each do |qtn|
           assert_equal @expected_db_name, 
-            @connection.send(:unqualify_db_name,qtn),
+            ActiveRecord::ConnectionAdapters::Sqlserver::Utils.unqualify_db_name(qtn),
             "This qualifed_table_name #{qtn} did not unqualify the db_name correctly."
         end
       end
@@ -140,7 +158,7 @@ class AdapterTestSqlserver < ActiveRecord::TestCase
     context 'with different language' do
       
       setup do
-        @default_language = @connection.user_options['language']
+        @default_language = @connection.user_options_language
       end
       
       teardown do
@@ -319,7 +337,7 @@ class AdapterTestSqlserver < ActiveRecord::TestCase
   end
   
   context 'For Quoting' do
-    
+
     should 'return 1 for #quoted_true' do
       assert_equal '1', @connection.quoted_true
     end
@@ -348,7 +366,129 @@ class AdapterTestSqlserver < ActiveRecord::TestCase
       assert_equal '[foo].[bar]', @connection.quote_column_name('foo.bar')
       assert_equal '[foo].[bar].[baz]', @connection.quote_column_name('foo.bar.baz')
     end
-    
+
+    context "#quote" do
+
+      context "string and multibyte values" do
+
+        context "on an activerecord :integer column" do
+
+          setup do
+            @column = Post.columns_hash['id']
+          end
+
+          should "return null for empty string" do
+            assert_nil @connection.quote('', @column)
+          end
+
+        end
+
+        context "on an activerecord :string column or with any value" do
+
+          should "surround it when N'...'" do
+            assert_equal "N'foo'", @connection.quote("foo")
+          end
+
+          should "escape all single quotes by repeating them" do
+            assert_equal "N'''quotation''s'''", @connection.quote("'quotation's'")
+          end
+
+        end
+
+      end
+
+      context "date and time values" do
+
+        setup do
+          @date = Date.parse '2000-01-01'
+          @column = SqlServerChronic.columns_hash['datetime']
+        end
+
+        context "on a sql datetime column" do
+
+          should "call quoted_datetime and surrounds its result with single quotes" do
+            assert_equal "'01-01-2000'", @connection.quote(@date, @column)
+          end
+
+        end
+
+      end
+
+    end
+
+    context "#quoted_datetime" do
+      
+      setup do
+        @iso_string = '2001-02-03T04:05:06-0700'
+        @date = Date.parse @iso_string
+        @time = Time.parse @iso_string
+        @datetime = DateTime.parse @iso_string
+      end
+      
+      context "with a Date" do
+
+        should "return a dd-mm-yyyy date string" do
+          assert_equal '02-03-2001', @connection.quoted_datetime(@date)
+        end
+
+      end
+
+      context "when the ActiveRecord default timezone is UTC" do
+
+        setup do
+          @old_activerecord_timezone = ActiveRecord::Base.default_timezone
+          ActiveRecord::Base.default_timezone = :utc
+        end
+
+        teardown do
+          ActiveRecord::Base.default_timezone = @old_activerecord_timezone
+          @old_activerecord_timezone = nil
+        end
+
+        context "with a Time" do
+
+          should "return an ISO 8601 datetime string" do
+            assert_equal '2001-02-03T11:05:06.000', @connection.quoted_datetime(@time)
+          end
+
+        end
+
+        context "with a DateTime" do
+
+          should "return an ISO 8601 datetime string" do
+            assert_equal '2001-02-03T11:05:06', @connection.quoted_datetime(@datetime)
+          end
+
+        end
+
+        context "with an ActiveSupport::TimeWithZone" do
+
+          context "wrapping a datetime" do
+
+            should "return an ISO 8601 datetime string with milliseconds" do
+              Time.use_zone('Eastern Time (US & Canada)') do
+                assert_equal '2001-02-03T11:05:06.000', @connection.quoted_datetime(@datetime.in_time_zone)
+              end
+            end
+
+          end
+
+          context "wrapping a time" do
+
+            should "return an ISO 8601 datetime string with milliseconds" do
+              Time.use_zone('Eastern Time (US & Canada)') do
+                assert_equal '2001-02-03T11:05:06.000', @connection.quoted_datetime(@time.in_time_zone)
+              end
+            end
+
+          end
+
+        end
+
+      end
+
+    end
+      
   end
   
   context 'When disabling referential integrity' do
@@ -382,12 +522,12 @@ class AdapterTestSqlserver < ActiveRecord::TestCase
     context "finding out what user_options are available" do
       
       should "run the database consistency checker useroptions command" do
-        @connection.expects(:select_rows).with(regexp_matches(/^dbcc\s+useroptions$/i)).returns []
+        @connection.expects(:select_rows).with(regexp_matches(/^dbcc\s+useroptions$/i), 'SCHEMA').returns []
         @connection.user_options
       end
       
       should "return a underscored key hash with indifferent access of the results" do
-        @connection.expects(:select_rows).with(regexp_matches(/^dbcc\s+useroptions$/i)).returns [['some', 'thing'], ['isolation level', 'read uncommitted']]
+        @connection.expects(:select_rows).with(regexp_matches(/^dbcc\s+useroptions$/i), 'SCHEMA').returns [['some', 'thing'], ['isolation level', 'read uncommitted']]
         uo = @connection.user_options
         assert_equal 2, uo.keys.size
         assert_equal 'thing', uo['some']
@@ -413,14 +553,14 @@ class AdapterTestSqlserver < ActiveRecord::TestCase
           @t2 = tasks(:another_task)
           assert @t1, 'Tasks :first_task should be in AR fixtures'
           assert @t2, 'Tasks :another_task should be in AR fixtures'
-          good_isolation_level = @connection.user_options[:isolation_level].blank? || @connection.user_options[:isolation_level] =~ /read committed/i
-          assert good_isolation_level, "User isolation level is not at a happy starting place: #{@connection.user_options[:isolation_level].inspect}"
+          good_isolation_level = @connection.user_options_isolation_level.blank? || @connection.user_options_isolation_level =~ /read committed/i
+          assert good_isolation_level, "User isolation level is not at a happy starting place: #{@connection.user_options_isolation_level.inspect}"
         end
         
         should 'allow #run_with_isolation_level to not take a block to set it' do
           begin
             @connection.run_with_isolation_level 'READ UNCOMMITTED'
-            assert_match %r|read uncommitted|i, @connection.user_options[:isolation_level]
+            assert_match %r|read uncommitted|i, @connection.user_options_isolation_level
           ensure
             @connection.run_with_isolation_level 'READ COMMITTED'
           end

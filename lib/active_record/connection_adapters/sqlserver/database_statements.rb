@@ -3,6 +3,8 @@ module ActiveRecord
     module Sqlserver
       module DatabaseStatements
         
+        include CoreExt::DatabaseStatements
+        
         def select_rows(sql, name = nil)
           raw_select sql, name, [], :fetch => :rows
         end
@@ -38,11 +40,19 @@ module ActiveRecord
         end
 
         def outside_transaction?
-          info_schema_query { select_value("SELECT @@TRANCOUNT") == 0 }
+          select_value('SELECT @@TRANCOUNT', 'SCHEMA') == 0
         end
         
         def supports_statement_cache?
           true
+        end
+
+        def transaction(options = {})
+          if retry_deadlock_victim?
+            block_given? ? transaction_with_retry_deadlock_victim(options) { yield } : transaction_with_retry_deadlock_victim(options)
+          else
+            block_given? ? super(options) { yield } : super(options)
+          end
         end
 
         def begin_db_transaction
@@ -50,7 +60,7 @@ module ActiveRecord
         end
 
         def commit_db_transaction
-          do_execute "COMMIT TRANSACTION"
+          disable_auto_reconnect { do_execute "COMMIT TRANSACTION" }
         end
 
         def rollback_db_transaction
@@ -58,14 +68,14 @@ module ActiveRecord
         end
 
         def create_savepoint
-          do_execute "SAVE TRANSACTION #{current_savepoint_name}"
+          disable_auto_reconnect { do_execute "SAVE TRANSACTION #{current_savepoint_name}" }
         end
 
         def release_savepoint
         end
 
         def rollback_to_savepoint
-          do_execute "ROLLBACK TRANSACTION #{current_savepoint_name}"
+          disable_auto_reconnect { do_execute "ROLLBACK TRANSACTION #{current_savepoint_name}" }
         end
 
         def add_limit_offset!(sql, options)
@@ -120,19 +130,51 @@ module ActiveRecord
         end
         
         def user_options
-          info_schema_query do
-            select_rows("dbcc useroptions").inject(HashWithIndifferentAccess.new) do |values,row| 
-              set_option = row[0].gsub(/\s+/,'_')
-              user_value = row[1]
-              values[set_option] = user_value
-              values
-            end
+          return {} if sqlserver_azure?
+          select_rows("dbcc useroptions",'SCHEMA').inject(HashWithIndifferentAccess.new) do |values,row| 
+            set_option = row[0].gsub(/\s+/,'_')
+            user_value = row[1]
+            values[set_option] = user_value
+            values
+          end
+        end
+        
+        def user_options_dateformat
+          if sqlserver_azure?
+            select_value 'SELECT [dateformat] FROM [sys].[syslanguages] WHERE [langid] = @@LANGID', 'SCHEMA'
+          else
+            user_options['dateformat']
+          end
+        end
+        
+        def user_options_isolation_level
+          if sqlserver_azure?
+            sql = %|SELECT CASE [transaction_isolation_level] 
+                    WHEN 0 THEN NULL
+                    WHEN 1 THEN 'READ UNCOMITTED' 
+                    WHEN 2 THEN 'READ COMITTED' 
+                    WHEN 3 THEN 'REPEATABLE' 
+                    WHEN 4 THEN 'SERIALIZABLE' 
+                    WHEN 5 THEN 'SNAPSHOT' END AS [isolation_level] 
+                    FROM [sys].[dm_exec_sessions] 
+                    WHERE [session_id] = @@SPID|.squish
+            select_value sql, 'SCHEMA'
+          else
+            user_options['isolation_level']
+          end
+        end
+        
+        def user_options_language
+          if sqlserver_azure?
+            select_value 'SELECT @@LANGUAGE AS [language]', 'SCHEMA'
+          else
+            user_options['language']
           end
         end
 
         def run_with_isolation_level(isolation_level)
           raise ArgumentError, "Invalid isolation level, #{isolation_level}. Supported levels include #{valid_isolation_levels.to_sentence}." if !valid_isolation_levels.include?(isolation_level.upcase)
-          initial_isolation_level = user_options[:isolation_level] || "READ COMMITTED"
+          initial_isolation_level = user_options_isolation_level || "READ COMMITTED"
           do_execute "SET TRANSACTION ISOLATION LEVEL #{isolation_level}"
           begin
             yield 
@@ -147,6 +189,51 @@ module ActiveRecord
         
         def newsequentialid_function
           select_value "SELECT NEWSEQUENTIALID()"
+        end
+        
+        def activity_stats
+          select_all %|
+            SELECT
+               [session_id]    = s.session_id,
+               [user_process]  = CONVERT(CHAR(1), s.is_user_process),
+               [login]         = s.login_name,
+               [database]      = ISNULL(db_name(r.database_id), N''),
+               [task_state]    = ISNULL(t.task_state, N''),
+               [command]       = ISNULL(r.command, N''),
+               [application]   = ISNULL(s.program_name, N''),
+               [wait_time_ms]  = ISNULL(w.wait_duration_ms, 0),
+               [wait_type]     = ISNULL(w.wait_type, N''),
+               [wait_resource] = ISNULL(w.resource_description, N''),
+               [blocked_by]    = ISNULL(CONVERT (varchar, w.blocking_session_id), ''),
+               [head_blocker]  =
+                    CASE
+                        -- session has an active request, is blocked, but is blocking others
+                        WHEN r2.session_id IS NOT NULL AND r.blocking_session_id = 0 THEN '1'
+                        -- session is idle but has an open tran and is blocking others
+                        WHEN r.session_id IS NULL THEN '1'
+                        ELSE ''
+                    END,
+               [total_cpu_ms]   = s.cpu_time,
+               [total_physical_io_mb]   = (s.reads + s.writes) * 8 / 1024,
+               [memory_use_kb]  = s.memory_usage * 8192 / 1024,
+               [open_transactions] = ISNULL(r.open_transaction_count,0),
+               [login_time]     = s.login_time,
+               [last_request_start_time] = s.last_request_start_time,
+               [host_name]      = ISNULL(s.host_name, N''),
+               [net_address]    = ISNULL(c.client_net_address, N''),
+               [execution_context_id] = ISNULL(t.exec_context_id, 0),
+               [request_id]     = ISNULL(r.request_id, 0),
+               [workload_group] = N''
+            FROM sys.dm_exec_sessions s LEFT OUTER JOIN sys.dm_exec_connections c ON (s.session_id = c.session_id)
+            LEFT OUTER JOIN sys.dm_exec_requests r ON (s.session_id = r.session_id)
+            LEFT OUTER JOIN sys.dm_os_tasks t ON (r.session_id = t.session_id AND r.request_id = t.request_id)
+            LEFT OUTER JOIN
+            (SELECT *, ROW_NUMBER() OVER (PARTITION BY waiting_task_address ORDER BY wait_duration_ms DESC) AS row_num
+                FROM sys.dm_os_waiting_tasks
+            ) w ON (t.task_address = w.waiting_task_address) AND w.row_num = 1
+            LEFT OUTER JOIN sys.dm_exec_requests r2 ON (r.session_id = r2.blocking_session_id)
+            WHERE db_name(r.database_id) = '#{current_database}'
+            ORDER BY s.session_id|
         end
         
         # === SQLServer Specific (Rake/Test Helpers) ==================== #
@@ -223,15 +310,14 @@ module ActiveRecord
         
         # === SQLServer Specific (Executing) ============================ #
 
-        def do_execute(sql, name = nil)
-          name ||= 'EXECUTE'
+        def do_execute(sql, name = 'SQL')
           log(sql, name) do
-            with_auto_reconnect { raw_connection_do(sql) }
+            with_sqlserver_error_handling { raw_connection_do(sql) }
           end
         end
         
         def do_exec_query(sql, name, binds)
-          statement = quote(sql)
+          explaining = name == 'EXPLAIN'
           names_and_types = []
           params = []
           binds.each_with_index do |(column,value),index|
@@ -250,10 +336,17 @@ module ActiveRecord
                                  raise "Unknown bind columns. We can account for this."
                                end
             quoted_value = ar_column ? quote(v,column) : quote(v,nil)
-            params << "@#{index} = #{quoted_value}"
+            params << (explaining ? quoted_value : "@#{index} = #{quoted_value}")
           end
-          sql = "EXEC sp_executesql #{statement}"
-          sql << ", #{quote(names_and_types.join(', '))}, #{params.join(', ')}" unless binds.empty?
+          if explaining
+            params.each_with_index do |param, index|
+              substitute_at_finder = /(@#{index})(?=(?:[^']|'[^']*')*$)/ # Finds unquoted @n values.
+              sql.sub! substitute_at_finder, param
+            end
+          else
+            sql = "EXEC sp_executesql #{quote(sql)}"
+            sql << ", #{quote(names_and_types.join(', '))}, #{params.join(', ')}" unless binds.empty?
+          end
           raw_select sql, name, binds, :ar_result => true
         end
         
@@ -270,19 +363,21 @@ module ActiveRecord
         
         # === SQLServer Specific (Selecting) ============================ #
 
-        def raw_select(sql, name=nil, binds=[], options={})
-          log(sql,name,binds) do
-            begin
-              handle = raw_connection_run(sql)
-              handle_to_names_and_values(handle, options)
-            ensure
-              finish_statement_handle(handle)
-            end
+        def raw_select(sql, name='SQL', binds=[], options={})
+          log(sql,name,binds) { _raw_select(sql, options) }
+        end
+        
+        def _raw_select(sql, options={})
+          begin
+            handle = raw_connection_run(sql)
+            handle_to_names_and_values(handle, options)
+          ensure
+            finish_statement_handle(handle)
           end
         end
         
         def raw_connection_run(sql)
-          with_auto_reconnect do
+          with_sqlserver_error_handling do
             case @connection_options[:mode]
             when :dblib
               @connection.execute(sql)
@@ -337,7 +432,8 @@ module ActiveRecord
         
         def finish_statement_handle(handle)
           case @connection_options[:mode]
-          when :dblib  
+          when :dblib
+            handle.cancel if handle
           when :odbc
             handle.drop if handle && handle.respond_to?(:drop) && !handle.finished?
           end

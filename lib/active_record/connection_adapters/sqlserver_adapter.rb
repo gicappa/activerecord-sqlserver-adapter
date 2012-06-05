@@ -1,16 +1,22 @@
+require 'base64'
 require 'arel/visitors/sqlserver'
 require 'active_record'
+require 'active_record/base'
+require 'active_support/concern'
+require 'active_support/core_ext/string'
 require 'active_record/connection_adapters/abstract_adapter'
 require 'active_record/connection_adapters/sqlserver/core_ext/active_record'
+require 'active_record/connection_adapters/sqlserver/core_ext/database_statements'
+require 'active_record/connection_adapters/sqlserver/core_ext/explain'
 require 'active_record/connection_adapters/sqlserver/database_limits'
 require 'active_record/connection_adapters/sqlserver/database_statements'
 require 'active_record/connection_adapters/sqlserver/errors'
+require 'active_record/connection_adapters/sqlserver/schema_cache'
 require 'active_record/connection_adapters/sqlserver/schema_statements'
+require 'active_record/connection_adapters/sqlserver/showplan'
 require 'active_record/connection_adapters/sqlserver/quoting'
+require 'active_record/connection_adapters/sqlserver/utils'
 require 'active_record/connection_adapters/sqlserver/version'
-require 'active_support/core_ext/kernel/requires'
-require 'active_support/core_ext/string'
-require 'base64'
 
 module ActiveRecord
   
@@ -31,7 +37,7 @@ module ActiveRecord
       else
         raise ArgumentError, "Unknown connection mode in #{config.inspect}."
       end
-      ConnectionAdapters::SQLServerAdapter.new(logger,config.merge(:mode=>mode))
+      ConnectionAdapters::SQLServerAdapter.new(nil, logger, nil, config.merge(:mode=>mode))
     end
     
     protected
@@ -53,7 +59,7 @@ module ActiveRecord
       def initialize(name, default, sql_type = nil, null = true, sqlserver_options = {})
         @sqlserver_options = sqlserver_options.symbolize_keys
         super(name, default, sql_type, null)
-        @primary = @sqlserver_options[:is_identity]
+        @primary = @sqlserver_options[:is_identity] || @sqlserver_options[:is_primary]
       end
       
       class << self
@@ -72,6 +78,10 @@ module ActiveRecord
         @sqlserver_options[:is_identity]
       end
       
+      def is_primary?
+        @sqlserver_options[:is_primary]
+      end
+      
       def is_utf8?
         !!(@sql_type =~ /nvarchar|ntext|nchar/i)
       end
@@ -86,7 +96,7 @@ module ActiveRecord
       
       def sql_type_for_statement
         if is_integer? || is_real?
-          sql_type.sub(/\(\d+\)/,'')
+          sql_type.sub(/\((\d+)?\)/,'')
         else
           sql_type
         end
@@ -163,6 +173,7 @@ module ActiveRecord
       
       include Sqlserver::Quoting
       include Sqlserver::DatabaseStatements
+      include Sqlserver::Showplan
       include Sqlserver::SchemaStatements
       include Sqlserver::DatabaseLimits
       include Sqlserver::Errors
@@ -170,29 +181,28 @@ module ActiveRecord
       
       ADAPTER_NAME                = 'SQLServer'.freeze
       DATABASE_VERSION_REGEXP     = /Microsoft SQL Server\s+"?(\d{4}|\w+)"?/
-      SUPPORTED_VERSIONS          = [2005,2008,2010,2011].freeze
+      SUPPORTED_VERSIONS          = [2005,2008,2010,2011,2012]
       
-      attr_reader :database_version, :database_year
+      attr_reader :database_version, :database_year, :spid, :product_level, :product_version, :edition
       
       cattr_accessor :native_text_database_type, :native_binary_database_type, :native_string_database_type,
-                     :log_info_schema_queries, :enable_default_unicode_types, :auto_connect,
-                     :cs_equality_operator, :lowercase_schema_reflection, :auto_connect_duration
+                     :enable_default_unicode_types, :auto_connect, :retry_deadlock_victim,
+                     :cs_equality_operator, :lowercase_schema_reflection, :auto_connect_duration,
+                     :showplan_option
       
       self.enable_default_unicode_types = true
       
-      class << self
-        
-        def visitor_for(pool)
-          Arel::Visitors::SQLServer.new(pool)
-        end
-        
-      end
       
-      def initialize(logger,config)
+      def initialize(connection, logger, pool, config)
+        super(connection, logger, pool)
+        # AbstractAdapter Responsibility
+        @schema_cache = Sqlserver::SchemaCache.new self
+        @visitor = Arel::Visitors::SQLServer.new self
+        # Our Responsibility
+        @config = config
         @connection_options = config
         connect
-        super(@connection, logger)
-        @database_version = info_schema_query { select_value('SELECT @@version') }
+        @database_version = select_value 'SELECT @@version', 'SCHEMA'
         @database_year = begin
                            if @database_version =~ /Microsoft SQL Azure/i
                              @sqlserver_azure = true
@@ -204,8 +214,10 @@ module ActiveRecord
                          rescue
                            0
                          end
+        @product_level    = select_value "SELECT CAST(SERVERPROPERTY('productlevel') AS VARCHAR(128))", 'SCHEMA'
+        @product_version  = select_value "SELECT CAST(SERVERPROPERTY('productversion') AS VARCHAR(128))", 'SCHEMA'
+        @edition          = select_value "SELECT CAST(SERVERPROPERTY('edition') AS VARCHAR(128))", 'SCHEMA'
         initialize_dateformatter
-        initialize_sqlserver_caches
         use_database
         unless SUPPORTED_VERSIONS.include?(@database_year)
           raise NotImplementedError, "Currently, only #{SUPPORTED_VERSIONS.to_sentence} are supported. We got back #{@database_version}."
@@ -234,7 +246,19 @@ module ActiveRecord
         true
       end
       
+      def supports_bulk_alter?
+        false
+      end
+      
       def supports_savepoints?
+        true
+      end
+      
+      def supports_index_sort_order?
+        true
+      end
+      
+      def supports_explain?
         true
       end
       
@@ -265,6 +289,7 @@ module ActiveRecord
       end
 
       def disconnect!
+        @spid = nil
         case @connection_options[:mode]
         when :dblib
           @connection.close rescue nil
@@ -277,10 +302,6 @@ module ActiveRecord
         remove_database_connections_and_rollback { }
       end
       
-      def clear_cache!
-        initialize_sqlserver_caches
-      end
-      
       # === Abstract Adapter (Misc Support) =========================== #
       
       def pk_and_sequence_for(table_name)
@@ -289,7 +310,7 @@ module ActiveRecord
       end
 
       def primary_key(table_name)
-        identity_column(table_name).try(:name)
+        identity_column(table_name).try(:name) || schema_cache.columns[table_name].detect(&:is_primary?).try(:name)
       end
       
       # === SQLServer Specific (DB Reflection) ======================== #
@@ -310,6 +331,10 @@ module ActiveRecord
         @database_year == 2011
       end
       
+      def sqlserver_2012?
+        @database_year == 2012
+      end
+      
       def sqlserver_azure?
         @sqlserver_azure
       end
@@ -319,7 +344,7 @@ module ActiveRecord
       end
       
       def inspect
-        "#<#{self.class} version: #{version}, year: #{@database_year}, connection_options: #{@connection_options.inspect}>"
+        "#<#{self.class} version: #{version}, year: #{@database_year}, product_level: #{@product_level.inspect}, product_version: #{@product_version.inspect}, edition: #{@edition.inspect}, connection_options: #{@connection_options.inspect}>"
       end
       
       def auto_connect
@@ -329,6 +354,11 @@ module ActiveRecord
       def auto_connect_duration
         @@auto_connect_duration ||= 10
       end
+      
+      def retry_deadlock_victim
+        @@retry_deadlock_victim.is_a?(FalseClass) ? false : true
+      end
+      alias :retry_deadlock_victim? :retry_deadlock_victim
       
       def native_string_database_type
         @@native_string_database_type || (enable_default_unicode_types ? 'nvarchar' : 'varchar') 
@@ -354,7 +384,6 @@ module ActiveRecord
         @@cs_equality_operator || 'COLLATE Latin1_General_CS_AS_WS'
       end
       
-      
       protected
       
       # === Abstract Adapter (Misc Support) =========================== #
@@ -365,6 +394,8 @@ module ActiveRecord
           RecordNotUnique.new(message,e)
         when /conflicted with the foreign key constraint/i
           InvalidForeignKey.new(message,e)
+        when /has been chosen as the deadlock victim/i
+          DeadlockVictim.new(message,e)
         when *lost_connection_messages
           LostConnection.new(message,e)
         else
@@ -376,9 +407,9 @@ module ActiveRecord
       
       def connect
         config = @connection_options
-        @connection = case @connection_options[:mode]
+        @connection = case config[:mode]
                       when :dblib
-                        appname = config[:appname] || Rails.application.class.name.split('::').first rescue nil
+                        appname = config[:appname] || configure_application_name || Rails.application.class.name.split('::').first rescue nil
                         login_timeout = config[:login_timeout].present? ? config[:login_timeout].to_i : nil
                         timeout = config[:timeout].present? ? config[:timeout].to_i/1000 : nil
                         encoding = config[:encoding].present? ? config[:encoding] : nil
@@ -408,6 +439,7 @@ module ActiveRecord
                             client.execute("SET CURSOR_CLOSE_ON_COMMIT OFF").do
                             client.execute("SET IMPLICIT_TRANSACTIONS OFF").do
                           end
+                          client.execute("SET TEXTSIZE 2147483647").do
                         end
                       when :odbc
                         if config[:dsn].include?(';')
@@ -427,12 +459,27 @@ module ActiveRecord
                           end
                         end
                       end
+        @spid = _raw_select("SELECT @@SPID", :fetch => :rows).first.first
+        configure_connection
       rescue
         raise unless @auto_connecting
       end
       
+      # Override this method so every connection can be configured to your needs.
+      # For example: 
+      #    raw_connection_do "SET TEXTSIZE #{64.megabytes}"
+      #    raw_connection_do "SET CONCAT_NULL_YIELDS_NULL ON"
+      def configure_connection
+      end
+      
+      # Override this method so every connection can have a unique name. Max 30 characters. Used by TinyTDS only.
+      # For example:
+      #    "myapp_#{$$}_#{Thread.current.object_id}".to(29)
+      def configure_application_name
+      end
+      
       def initialize_dateformatter
-        @database_dateformat = user_options['dateformat']
+        @database_dateformat = user_options_dateformat
         a, b, c = @database_dateformat.each_char.to_a
         [a,b,c].each { |f| f.upcase! if f == 'y' }
         dateformat = "%#{a}-%#{b}-%#{c}"
@@ -450,13 +497,23 @@ module ActiveRecord
         end if block_given?
       end
       
-      def with_auto_reconnect
+      def with_sqlserver_error_handling
         begin
           yield
         rescue Exception => e
-          retry if translate_exception(e,e.message).is_a?(LostConnection) && auto_reconnected?
+          case translate_exception(e,e.message)
+            when LostConnection; retry if auto_reconnected?
+            when DeadlockVictim; retry if retry_deadlock_victim? && open_transactions == 0
+          end
           raise
         end
+      end
+      
+      def disable_auto_reconnect
+        old_auto_connect, self.class.auto_connect = self.class.auto_connect, false
+        yield
+      ensure
+        self.class.auto_connect = old_auto_connect
       end
       
       def auto_reconnected?

@@ -42,8 +42,7 @@ module ActiveRecord
         end
 
         def quote_column_name(name)
-          @sqlserver_quoted_column_and_table_names[name] ||= 
-            name.to_s.split('.').map{ |n| n =~ /^\[.*\]$/ ? n : "[#{n.to_s.gsub(']', ']]')}]" }.join('.')
+          schema_cache.quote_name(name)
         end
 
         def quote_table_name(name)
@@ -68,7 +67,16 @@ module ActiveRecord
 
         def quoted_datetime(value)
           if value.acts_like?(:time)
-            value.is_a?(Date) ? quoted_value_acts_like_time_filter(value).to_time.xmlschema.to(18) : quoted_value_acts_like_time_filter(value).iso8601(3).to(22)
+            time_zone_qualified_value = quoted_value_acts_like_time_filter(value)
+            if value.is_a?(Date)
+              time_zone_qualified_value.to_time.xmlschema.to(18)
+            else
+              # CHANGED [Ruby 1.8] Not needed when 1.8 is dropped.
+              if value.is_a?(ActiveSupport::TimeWithZone) && RUBY_VERSION < '1.9'
+                time_zone_qualified_value = time_zone_qualified_value.to_time 
+              end
+              time_zone_qualified_value.iso8601(3).to(22)
+            end
           else
             quoted_date(value)
           end

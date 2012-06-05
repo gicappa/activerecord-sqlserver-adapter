@@ -72,7 +72,11 @@ ActiveRecord::Schema.define do
   create_table :sql_server_binary_types, :force => true do |t|
     # TODO: Add some different native binary types and test.
   end
-  
+
+  create_table 'my$strange_table', :force => true do |t|
+    t.column :number, :real
+  end
+    
   create_table :sql_server_edge_schemas, :force => true do |t|
     t.string :description
     t.column :bigint, :bigint
@@ -87,15 +91,50 @@ ActiveRecord::Schema.define do
     t.string :name
   end
   
+  # http://blogs.msdn.com/b/craigfr/archive/2008/03/19/ranking-functions-row-number.aspx
+  execute "IF EXISTS(SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'order_row_number') DROP TABLE order_row_number"
+  execute <<-ORDERROWNUMBERSQL
+    CREATE TABLE [order_row_number] (id int IDENTITY, a int, b int, c int)
+    CREATE UNIQUE CLUSTERED INDEX [idx_order_row_number_id] ON [order_row_number] ([id])
+    INSERT [order_row_number] VALUES (0, 1, 8)
+    INSERT [order_row_number] VALUES (0, 3, 6)
+    INSERT [order_row_number] VALUES (0, 5, 4)
+    INSERT [order_row_number] VALUES (0, 7, 2)
+    INSERT [order_row_number] VALUES (0, 9, 0)
+    INSERT [order_row_number] VALUES (1, 0, 9)
+    INSERT [order_row_number] VALUES (1, 2, 7)
+    INSERT [order_row_number] VALUES (1, 4, 5)
+    INSERT [order_row_number] VALUES (1, 6, 3)
+    INSERT [order_row_number] VALUES (1, 8, 1)
+  ORDERROWNUMBERSQL
+  
   execute "IF EXISTS(SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'natural_pk_data') DROP TABLE natural_pk_data"
   execute <<-NATURALPKTABLESQL
     CREATE TABLE natural_pk_data(
     	parent_id int,
     	name nvarchar(255),
     	description nvarchar(1000),
-    	legacy_id nvarchar(10) NOT NULL PRIMARY KEY,
+    	legacy_id nvarchar(10) NOT NULL PRIMARY KEY
     )
   NATURALPKTABLESQL
+  
+  execute "IF EXISTS(SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'natural_pk_int_data') DROP TABLE natural_pk_int_data"
+  execute <<-NATURALPKINTTABLESQL
+    CREATE TABLE natural_pk_int_data(
+      legacy_id int NOT NULL PRIMARY KEY,
+      parent_id int,
+      name nvarchar(255),
+      description nvarchar(1000)
+    )
+  NATURALPKINTTABLESQL
+  
+  execute "IF EXISTS(SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'tinyint_pk_table') DROP TABLE tinyint_pk_table"
+  execute <<-TINYITPKTABLE
+    CREATE TABLE tinyint_pk_table(
+      id tinyint NOT NULL PRIMARY KEY,
+      name nvarchar(255)
+    )
+  TINYITPKTABLE
   
   create_table 'quoted-table', :force => true do |t|
   end
